@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -361,16 +362,31 @@ def test_restart_fails_interrupted_jobs_and_keeps_queued(tmp_path):
     first = Portal(data_dir)
     try:
         upload(first, CSV_SPRING)
-        # Simulate a crash while the generator held a job mid-run.
+        # Simulate a crash while the generator held a job mid-run, and a
+        # second job still waiting in the queue. The queued job carries the
+        # same persisted corpus snapshot a real submission would have, so its
+        # scope must survive the restart.
         with first.db.transaction() as conn:
-            conn.execute(
-                "INSERT INTO jobs(batch, status, requested_at) VALUES ('B1', 'running', ?)",
+            crashed = conn.execute(
+                "INSERT INTO jobs(batch, status, requested_at) "
+                "VALUES ('B1', 'running', ?)",
                 ("2026-01-01T00:00:00+00:00",),
             )
-            conn.execute(
-                "INSERT INTO jobs(batch, status, requested_at) VALUES ('B2', 'queued', ?)",
+            queued_cursor = conn.execute(
+                "INSERT INTO jobs(batch, status, requested_at, total_rows) "
+                "VALUES ('B2', 'queued', ?, 1)",
                 ("2026-01-01T00:00:00+00:00",),
             )
+            queued_id = int(queued_cursor.lastrowid)
+            b2_row = conn.execute(
+                "SELECT id, respondent_id FROM utterances WHERE batch = 'B2'"
+            ).fetchone()
+            conn.execute(
+                "INSERT INTO job_utterances(job_id, utterance_id, respondent_id, "
+                "position) VALUES (?, ?, ?, 0)",
+                (queued_id, int(b2_row["id"]), b2_row["respondent_id"]),
+            )
+            assert int(crashed.lastrowid)
     finally:
         first.shutdown()
 
@@ -426,3 +442,237 @@ def test_download_blocks_text_withdrawn_before_export(portal):
             break
         time.sleep(0.05)
     assert row["status"] == "deleted"
+
+
+# ---------------------------------------------------------------------------
+# fixed corpus scope: uploads interleaved with a submitted job
+# ---------------------------------------------------------------------------
+class _ChunkBarrier:
+    """Deterministic interleaving point inside the chunked export loop.
+
+    The generator parks after the first chunk has been streamed (the same
+    boundary the real 20-row chunking creates), so the test can upload
+    supplementary rows *while the job is already running* without relying on
+    sleeps or timing luck.
+    """
+
+    def __init__(self) -> None:
+        self._reached = threading.Event()
+        self._release = threading.Event()
+
+    def wait_reached(self, timeout: float = 5.0) -> None:
+        if not self._reached.wait(timeout):
+            raise AssertionError("generator never reached the chunk barrier")
+
+    def release(self) -> None:
+        self._release.set()
+
+    def __call__(self, *args, **kwargs):
+        self._reached.set()
+        if not self._release.wait(timeout=10.0):
+            raise AssertionError("chunk barrier was never released")
+        return None
+
+
+def _corpus_csv(rows: int) -> str:
+    return "batch,respondent_id,text\n" + "\n".join(
+        f"B1,R{i:03d},第{i}段访谈正文内容用于稳定复现上传交错" for i in range(1, rows + 1)
+    )
+
+
+def _wait_job(instance: Portal, job_id: int) -> dict:
+    return wait_for(instance, job_id)
+
+
+def _export_for_job(instance: Portal, job_id: int) -> dict:
+    return next(e for e in instance.exports() if e["job_id"] == job_id)
+
+
+def test_upload_during_generation_keeps_submitted_scope_and_progress(portal):
+    """The 21 -> 22 interleaving, reproduced deterministically.
+
+    A 21-row job streams its first 20-row chunk and parks; a supplementary
+    upload for the same batch lands while generation is in flight. The fixed
+    submission-time scope must keep the job, its progress and the exported file
+    at 21 rows; the new row only enters the next generation.
+    """
+    upload(portal, _corpus_csv(21))
+    job_id = portal.create_job("B1")
+    assert next(j for j in portal.jobs() if j["id"] == job_id)["total_rows"] == 21
+
+    barrier = _ChunkBarrier()
+    original_abort = portal._abort_reason
+    portal._abort_reason = lambda *a, **k: (barrier(), original_abort(*a, **k))[1]
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            job = next(j for j in portal.jobs() if j["id"] == job_id)
+            if job["status"] == "running":
+                break
+            time.sleep(0.02)
+        barrier.wait_reached()
+
+        # Supplementary interview for the same batch, uploaded mid-generation.
+        upload(portal, "batch,respondent_id,text\nB1,R999,提交任务之后才补充上传的访谈\n")
+        assert portal.batches() and portal.stats()["utterances"] == 22
+        barrier.release()
+
+        job = _wait_job(portal, job_id)
+    finally:
+        portal._abort_reason = original_abort
+
+    assert job["status"] == "completed"
+    assert job["total_rows"] == 21
+    # Progress never overshoots the fixed scope, at any sampled moment.
+    assert job["written_rows"] == 21
+
+    export = _export_for_job(portal, job_id)
+    handle, _name, error = portal.open_download(export["id"])
+    assert error is None and handle is not None
+    content = handle.read().decode("utf-8")
+    handle.close()
+    # Header plus exactly the 21 in-scope rows; the late row is not exported.
+    body_lines = [line for line in content.splitlines() if line]
+    assert len(body_lines) == 22
+    assert "提交任务之后才补充上传的访谈" not in content
+    assert export["row_count"] == 21
+
+    # The supplementary row enters the next generation of the same batch.
+    next_job = portal.create_job("B1")
+    job2 = _wait_job(portal, next_job)
+    assert job2["total_rows"] == 22 and job2["written_rows"] == 22
+    handle, _name, error = portal.open_download(_export_for_job(portal, next_job)["id"])
+    assert error is None and handle is not None
+    content2 = handle.read().decode("utf-8")
+    handle.close()
+    assert "提交任务之后才补充上传的访谈" in content2
+    assert len([line for line in content2.splitlines() if line]) == 23
+
+
+def test_queued_job_scope_survives_restart_and_excludes_later_upload(tmp_path):
+    """The fixed scope is persisted: a queued job keeps it across a restart."""
+    data_dir = tmp_path / "data"
+    first = Portal(data_dir)  # no workers: the job stays queued
+    try:
+        upload(first, _corpus_csv(21))
+        job_id = first.create_job("B1")
+        upload(first, "batch,respondent_id,text\nB1,R999,排队期间补充上传的访谈\n")
+        queued = next(j for j in first.jobs() if j["id"] == job_id)
+        assert queued["status"] == "queued" and queued["total_rows"] == 21
+    finally:
+        first.shutdown()
+
+    second = Portal(data_dir)
+    second.start_workers()
+    try:
+        job = _wait_job(second, job_id)
+        assert job["status"] == "completed"
+        assert job["total_rows"] == 21 and job["written_rows"] == 21
+        export = _export_for_job(second, job_id)
+        assert export["row_count"] == 21
+        handle, _name, error = second.open_download(export["id"])
+        assert error is None and handle is not None
+        content = handle.read().decode("utf-8")
+        handle.close()
+        assert "排队期间补充上传的访谈" not in content
+
+        next_job = second.create_job("B1")
+        job2 = _wait_job(second, next_job)
+        assert job2["total_rows"] == 22
+    finally:
+        second.shutdown()
+
+
+def test_revocation_while_queued_blocks_job_through_persisted_scope(tmp_path):
+    """Revocation is not delayed by the fixed scope: a queued job is blocked.
+
+    The respondent's utterance rows are deleted by the revocation, but the
+    job's submission-time snapshot still names them, so the block works even
+    though generation has not started and survives a restart in between.
+    """
+    data_dir = tmp_path / "data"
+    first = Portal(data_dir)  # no workers: the job stays queued
+    try:
+        upload(first, _corpus_csv(21))
+        job_id = first.create_job("B1")
+        result = first.revoke("R005")
+        assert result["deleted_rows"] == 1
+        job = next(j for j in first.jobs() if j["id"] == job_id)
+        assert job["status"] == "blocked"
+        assert first.exports() == []
+    finally:
+        first.shutdown()
+
+    second = Portal(data_dir)
+    second.start_workers()
+    try:
+        time.sleep(0.3)
+        job = next(j for j in second.jobs() if j["id"] == job_id)
+        assert job["status"] == "blocked"
+        assert second.exports() == []
+    finally:
+        second.shutdown()
+
+
+def test_revocation_of_late_uploaded_respondent_does_not_block_earlier_job(portal):
+    """Scope semantics: rows uploaded after submission belong to the next run."""
+    upload(portal, _corpus_csv(21))
+    job_id = portal.create_job("B1")
+    # R999 is never part of job_id's fixed scope.
+    upload(portal, "batch,respondent_id,text\nB1,R999,后来才上传的受访者语料\n")
+    portal.revoke("R999")
+
+    job = _wait_job(portal, job_id)
+    assert job["status"] == "completed"
+    export = _export_for_job(portal, job_id)
+    handle, _name, error = portal.open_download(export["id"])
+    assert error is None and handle is not None
+    handle.close()
+
+
+def test_web_progress_matches_export_rows_with_interleaved_upload(client):
+    """End-to-end through the browser API: status progress equals export rows."""
+    test_client, instance = client
+    r = test_client.post(
+        "/upload",
+        files={"file": ("corpus.csv", _corpus_csv(21).encode("utf-8"), "text/csv")},
+    )
+    assert r.status_code == 200
+    r = test_client.post("/generate", data={"batch": "B1"})
+    assert r.status_code == 200
+    job_id = instance.jobs()[0]["id"]
+
+    barrier = _ChunkBarrier()
+    original_abort = instance._abort_reason
+    instance._abort_reason = lambda *a, **k: (barrier(), original_abort(*a, **k))[1]
+    try:
+        barrier.wait_reached()
+        r = test_client.post(
+            "/upload",
+            files={
+                "file": (
+                    "supplement.csv",
+                    "batch,respondent_id,text\nB1,R999,网页流程中交错上传的补充访谈\n".encode(
+                        "utf-8"
+                    ),
+                    "text/csv",
+                )
+            },
+        )
+        assert r.status_code == 200
+        barrier.release()
+        job = _wait_job(instance, job_id)
+    finally:
+        instance._abort_reason = original_abort
+
+    status = test_client.get("/api/status").json()
+    api_job = next(j for j in status["jobs"] if j["id"] == job_id)
+    api_export = next(e for e in status["exports"] if e["job_id"] == job_id)
+    assert api_job["total_rows"] == 21
+    assert api_job["written_rows"] == api_job["total_rows"]
+    assert api_export["row_count"] == api_job["written_rows"]
+
+    r = test_client.get(f"/download/{api_export['id']}")
+    assert r.status_code == 200
+    assert len([line for line in r.text.splitlines() if line]) == api_export["row_count"] + 1
+    assert "网页流程中交错上传的补充访谈" not in r.text

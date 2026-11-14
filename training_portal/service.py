@@ -354,25 +354,20 @@ class Portal:
                     (f"受访者 {respondent_id} 撤回授权", *export_ids),
                 ).rowcount
 
-            # Any job that touches this respondent can no longer be published,
-            # whether it is queued, running or paused at the demo gate. The job
-            # snapshot covers jobs whose rows were already removed by an earlier
-            # revocation for the same batch.
-            blocked_jobs = 0
-            if batches:
-                placeholders = ",".join("?" for _ in batches)
-                blocked_jobs = conn.execute(
-                    f"UPDATE jobs SET status = 'blocked', finished_at = ?, message = ? "
-                    f"WHERE (batch IN ({placeholders}) OR id IN "
-                    f"(SELECT job_id FROM job_respondents WHERE respondent_id = ?)) "
-                    f"AND status IN ('queued', 'running', 'paused')",
-                    (
-                        now,
-                        f"批次包含已撤回编号 {respondent_id}，结果不发布",
-                        *batches,
-                        respondent_id,
-                    ),
-                ).rowcount
+            # Any open job whose fixed scope contains this respondent can no
+            # longer be published, whether it is queued, running or paused at
+            # the demo gate. The check goes through the submission-time
+            # snapshot: it still matches after this transaction deletes the
+            # utterance rows, including for a job that has not started yet.
+            # Rows uploaded after the job was submitted are out of its scope,
+            # so revoking their respondent never blocks the earlier job.
+            blocked_jobs = conn.execute(
+                "UPDATE jobs SET status = 'blocked', finished_at = ?, message = ? "
+                "WHERE id IN (SELECT job_id FROM job_utterances "
+                "             WHERE respondent_id = ?) "
+                "AND status IN ('queued', 'running', 'paused')",
+                (now, f"批次包含已撤回编号 {respondent_id}，结果不发布", respondent_id),
+            ).rowcount
 
             conn.execute(
                 "UPDATE revocations SET deleted_rows = ?, affected_exports = ?, "
@@ -420,28 +415,40 @@ class Portal:
     # generation jobs
     # ------------------------------------------------------------------
     def create_job(self, batch: str) -> int:
+        """Submit a generation job and fix its corpus scope in the same commit.
+
+        The job snapshots the exact utterance rows of the batch as they exist
+        now. Supplementary rows uploaded after this point get new utterance ids
+        and are absent from the snapshot, so they cannot leak into this run and
+        can only enter the next job for the batch. The snapshot and the fixed
+        row total are persisted in SQLite, which keeps the scope stable while
+        the job waits in the queue and across service restarts.
+        """
         batch = batch.strip()
         if not batch:
             raise ValidationError("请选择批次")
         with self.db.transaction() as conn:
-            respondents = [
-                row["respondent_id"]
-                for row in conn.execute(
-                    "SELECT DISTINCT respondent_id FROM utterances "
-                    "WHERE batch = ? ORDER BY respondent_id",
-                    (batch,),
-                )
-            ]
-            if not respondents:
+            scope = conn.execute(
+                "SELECT id, respondent_id FROM utterances "
+                "WHERE batch = ? ORDER BY id",
+                (batch,),
+            ).fetchall()
+            if not scope:
                 raise ValidationError("批次不存在或已没有可用语料")
+            now = utc_now()
             cursor = conn.execute(
-                "INSERT INTO jobs(batch, status, requested_at) VALUES (?, 'queued', ?)",
-                (batch, utc_now()),
+                "INSERT INTO jobs(batch, status, requested_at, total_rows) "
+                "VALUES (?, 'queued', ?, ?)",
+                (batch, now, len(scope)),
             )
             job_id = int(cursor.lastrowid)
             conn.executemany(
-                "INSERT INTO job_respondents(job_id, respondent_id) VALUES (?, ?)",
-                [(job_id, r) for r in respondents],
+                "INSERT INTO job_utterances(job_id, utterance_id, respondent_id, "
+                "position) VALUES (?, ?, ?, ?)",
+                [
+                    (job_id, int(row["id"]), row["respondent_id"], position)
+                    for position, row in enumerate(scope)
+                ],
             )
         self._wake.set()
         return job_id
@@ -542,12 +549,15 @@ class Portal:
     def _write_export(
         self, job_id: int, batch: str, tmp_path: Path
     ) -> dict[str, Any] | None:
-        """Stream one batch to a temp file, re-checking consent every chunk.
+        """Stream the job's fixed corpus snapshot to a temp file.
 
-        If anyone in the batch revokes mid-run the whole run is abandoned:
-        their text is interleaved with everyone else's, so publishing the
-        remaining rows would still leak it into prompts. The temp file is never
-        published. Returns ``None`` when the job was blocked.
+        Only utterances captured in ``job_utterances`` at submission time are
+        read, so rows uploaded while the job is queued or running can never
+        enter the file or inflate the progress counter. Consent is re-checked
+        before every chunk; if anyone in the fixed scope revokes mid-run the
+        whole run is abandoned because their text is interleaved with everyone
+        else's and publishing the remaining rows would still leak it. The temp
+        file is never published. Returns ``None`` when the job was blocked.
         """
         respondents: set[str] = set()
         hashes: set[str] = set()
@@ -557,37 +567,65 @@ class Portal:
         with self.db.read() as conn:
             total = int(
                 conn.execute(
-                    "SELECT COUNT(*) AS c FROM utterances WHERE batch = ?", (batch,)
+                    "SELECT COUNT(*) AS c FROM job_utterances WHERE job_id = ?",
+                    (job_id,),
                 ).fetchone()["c"]
             )
         with self.db.transaction() as conn:
-            conn.execute("UPDATE jobs SET total_rows = ? WHERE id = ?", (total, job_id))
+            # Keep the displayed denominator equal to the fixed scope even if
+            # the row was created before total_rows was maintained.
+            conn.execute(
+                "UPDATE jobs SET total_rows = ? WHERE id = ? AND total_rows <> ?",
+                (total, job_id, total),
+            )
 
         with tmp_path.open("w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow([BATCH_COLUMN, RESPONDENT_COLUMN, TEXT_COLUMN])
-            cursor = 0
+            position = 0
             while True:
                 abort_reason = self._abort_reason(job_id, batch)
                 if abort_reason:
                     break
                 with self.db.read() as conn:
+                    # The snapshot decides *which* rows belong to this job; the
+                    # join to utterances only supplies their content. Rows added
+                    # to the batch after submission are not in the snapshot and
+                    # can never appear here. A LEFT JOIN lets a missing row be
+                    # detected explicitly instead of silently shrinking output.
                     chunk = conn.execute(
-                        "SELECT id, respondent_id, text FROM utterances "
-                        "WHERE batch = ? AND id > ? ORDER BY id LIMIT ?",
-                        (batch, cursor, CHUNK_ROWS),
+                        "SELECT ju.position, ju.respondent_id AS respondent_id, "
+                        "u.id AS utterance_id, u.text AS text "
+                        "FROM job_utterances ju "
+                        "LEFT JOIN utterances u ON u.id = ju.utterance_id "
+                        "WHERE ju.job_id = ? AND ju.position >= ? "
+                        "ORDER BY ju.position LIMIT ?",
+                        (job_id, position, CHUNK_ROWS),
                     ).fetchall()
                 if not chunk:
                     break
                 for row in chunk:
-                    cursor = int(row["id"])
+                    position = int(row["position"]) + 1
+                    if row["text"] is None:
+                        # The in-scope row is gone outside the normal revocation
+                        # flow (e.g. manual database repair). Drop the partial
+                        # file rather than publish an export that no longer
+                        # matches the consented corpus.
+                        abort_reason = (
+                            f"语料行（编号 {row['respondent_id']}）在生成期间缺失，"
+                            "结果不发布"
+                        )
+                        break
                     writer.writerow([batch, row["respondent_id"], row["text"]])
                     respondents.add(row["respondent_id"])
                     hashes.add(text_hash(row["text"]))
                     written += 1
+                if abort_reason:
+                    break
                 with self.db.transaction() as conn:
                     conn.execute(
-                        "UPDATE jobs SET written_rows = ? WHERE id = ? AND status = 'running'",
+                        "UPDATE jobs SET written_rows = ? "
+                        "WHERE id = ? AND status = 'running'",
                         (written, job_id),
                     )
                 time.sleep(0.01)
@@ -614,6 +652,22 @@ class Portal:
                 )
             return None
 
+        # Invariant backing the progress display: every snapshot row is written
+        # once, so the export has exactly the fixed-scope row count.
+        if written != total:
+            with self.db.transaction() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status = 'failed', finished_at = ?, message = ? "
+                    "WHERE id = ? AND status = 'running'",
+                    (
+                        utc_now(),
+                        f"导出行数 {written} 与提交时固定的语料范围 {total} 不一致，"
+                        "结果不发布",
+                        job_id,
+                    ),
+                )
+            return None
+
         return {"respondents": respondents, "hashes": hashes, "written": written}
 
     def _abort_reason(
@@ -625,11 +679,17 @@ class Portal:
             ).fetchone()
             if job is None or job["status"] not in ("running", "paused", "queued"):
                 return "任务已因撤回被中止，结果不发布"
+            # Only respondents inside this job's fixed scope can block it, and
+            # the snapshot still names them after their utterance rows are
+            # deleted by the revocation transaction. Revocation therefore takes
+            # effect at the next chunk boundary without waiting for any corpus
+            # freeze; respondents whose rows were uploaded after submission are
+            # out of scope and do not stop this run.
             revoked = conn.execute(
-                "SELECT DISTINCT u.respondent_id FROM utterances u "
-                "JOIN revocations r ON r.respondent_id = u.respondent_id "
-                "WHERE u.batch = ? LIMIT 1",
-                (batch,),
+                "SELECT ju.respondent_id FROM job_utterances ju "
+                "JOIN revocations r ON r.respondent_id = ju.respondent_id "
+                "WHERE ju.job_id = ? LIMIT 1",
+                (job_id,),
             ).fetchone()
             if revoked:
                 return f"生成过程中受访者 {revoked['respondent_id']} 撤回授权，结果不发布"

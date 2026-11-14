@@ -252,6 +252,7 @@ def api_status():
             "exports": [
                 {
                     "id": row["id"],
+                    "job_id": row["job_id"],
                     "batch": row["batch"],
                     "status": row["status"],
                     "row_count": row["row_count"],

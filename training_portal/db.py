@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     requested_at    TEXT NOT NULL,
     started_at      TEXT,
     finished_at     TEXT,
+    -- Fixed at submission time from the corpus snapshot below; later uploads
+    -- never change it, so web progress can never overshoot the exported rows.
     total_rows      INTEGER NOT NULL DEFAULT 0,
     written_rows    INTEGER NOT NULL DEFAULT 0,
     export_id       INTEGER,
@@ -71,16 +73,25 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_batch ON jobs(batch);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 
--- Snapshot of who was in the batch when the job was claimed. Kept after the
--- batch rows are deleted so a running job can still tell that consent changed.
-CREATE TABLE IF NOT EXISTS job_respondents (
+-- Corpus scope fixed when the job is submitted: the exact utterance rows of
+-- the batch at that instant. Rows uploaded afterwards get higher utterance ids
+-- and are simply not part of any existing snapshot, so they only enter a later
+-- job. The snapshot lives in SQLite, so it survives while the job is queued and
+-- across service restarts. It also keeps the respondent of every in-scope row
+-- after the rows themselves are deleted by a revocation, letting the job be
+-- blocked promptly instead of silently dropping the withdrawn rows.
+CREATE TABLE IF NOT EXISTS job_utterances (
     job_id        INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    utterance_id  INTEGER NOT NULL,
     respondent_id TEXT NOT NULL,
-    PRIMARY KEY (job_id, respondent_id)
+    position      INTEGER NOT NULL,
+    PRIMARY KEY (job_id, position)
 );
 
-CREATE INDEX IF NOT EXISTS idx_job_respondents_resp
-    ON job_respondents(respondent_id);
+CREATE INDEX IF NOT EXISTS idx_job_utterances_job
+    ON job_utterances(job_id, utterance_id);
+CREATE INDEX IF NOT EXISTS idx_job_utterances_resp
+    ON job_utterances(respondent_id);
 
 CREATE TABLE IF NOT EXISTS exports (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,

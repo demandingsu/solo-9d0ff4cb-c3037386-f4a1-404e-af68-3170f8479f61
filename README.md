@@ -26,6 +26,9 @@ uvicorn training_portal.main:app --port 8000
 1. **上传 CSV**：包含 `batch`（访谈批次）、`respondent_id`（受访者编号）、`text`（文本）三列；
    也接受中文表头「访谈批次 / 受访者编号 / 文本」。编码支持 UTF-8 与 GB18030。
 2. **生成训练 CSV**：从下拉框选择批次，后台线程按 20 行一个分块写出临时文件，完成后发布为可下载文件。
+   **任务提交的同一事务会把该批次当时的语料行快照进数据库（`job_utterances`），本次生成的语料范围就此固定**：
+   提交后才上传的补充访谈不属于该快照，不会混入正在排队或生成中的任务，只会进入下一次生成；
+   快照持久在 SQLite 中，任务排队期间、服务重启后范围都不变，进度分母恒为提交时的行数，与实际导出行数一致。
 3. **查看状态**：任务（排队 / 生成中 / 演示暂停 / 已完成 / 已阻止 / 失败）与导出文件
    （可下载 / 待清理 / 已删除）都有实时状态，页面会就地刷新行内容而不整页重载。
 4. **撤回授权**：输入受访者编号，立即删除其全部语料行、锁定并清理所有含其文本的导出文件。
@@ -37,8 +40,11 @@ uvicorn training_portal.main:app --port 8000
 
 | 场景 | 行为 |
 | --- | --- |
+| 任务提交后又上传同批次补充行 | 新行不在提交时的语料快照内，不进入本次生成（进度与导出都保持提交时行数），只进入下一次任务 |
+| 任务排队期间重启服务 | 语料快照在 SQLite 中持久保留，重启后任务按原范围继续，补充行仍被排除 |
 | 撤回已生成的导出文件 | 立即置为 `pending_delete`，后台删除；删除前不可下载 |
 | 撤回时该批次正在生成 | 下一个分块检测到撤回即中止整个任务，结果不发布（其文本与其他语料交错，只删其行仍会泄漏） |
+| 撤回时任务仍在排队 | 撤回事务经任务快照匹配到该受访者，任务立即标记 `blocked`，固定语料不会延迟撤回 |
 | 撤回时任务停在「演示暂停」 | 任务被标记 `blocked`，发布闸门拒绝发布，临时文件删除 |
 | 撤回后重新上传同号 | 上传时按编号过滤，计入「跳过撤回」，不会重新纳入 |
 | 撤回后原文换了编号再传 | 撤回时记录文本 SHA-256，同文换号同样被拒 |
@@ -74,6 +80,22 @@ docker compose up --build            # 打开 http://localhost:8000
 6. 「删除失败次数」填 3 → 撤回导出中的任一编号 → 导出「待清理」→ 重启容器 → 仍不可下载，预算耗尽后自动删除
 ```
 
+### 上传交错复现（21 行任务不再写出 22 行）
+
+自动化、可稳定复现的交错验证在测试套件中（`_ChunkBarrier` 让生成器在首个 20 行分块处确定地暂停，
+不依赖 sleep）：
+
+```bash
+pytest tests/test_portal.py -k "scope or interleaved or progress"
+```
+
+- `test_upload_during_generation_keeps_submitted_scope_and_progress`：21 行任务生成到一半时上传补充行，
+  任务进度与导出文件保持 21 行，补充行只出现在下一次生成（22 行）。
+- `test_queued_job_scope_survives_restart_and_excludes_later_upload`：排队期间上传并重启，范围仍固定。
+- `test_revocation_while_queued_blocks_job_through_persisted_scope`：排队中撤回立即阻止，且重启后保持。
+- `test_web_progress_matches_export_rows_with_interleaved_upload`：走浏览器同款 HTTP 接口，
+  校验 `/api/status` 进度与实际下载文件行数完全一致。
+
 样例：`samples/batch_2026_spring.csv`（两个批次）、`samples/batch_2026_summer.csv`、
 `samples/reupload_revoked.csv`（撤回后重传同号 + 原文换号）。
 
@@ -86,6 +108,7 @@ training_portal/
   db.py         SQLite schema（WAL + BEGIN IMMEDIATE 单写者）
   templates/    单一仪表盘页面
   static/       样式与就地刷新的轮询脚本
-tests/          20 个测试，覆盖上传、生成、各类撤回时序、删除失败、重启续清与文本换号
+tests/          25 个测试，覆盖上传、生成、上传交错下的语料范围固定、排队/重启后范围保留、
+                各类撤回时序（含排队中撤回与范围外撤回）、删除失败、重启续清与文本换号
 samples/        可直接上传的本地样例
 ```
